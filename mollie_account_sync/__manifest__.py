@@ -2,7 +2,7 @@
 
 {
     'name': 'Mollie Settlement Sync',
-    'version': '16.0.0.1',
+    'version': '16.0.0.4',
     'description': '',
     'summary': 'This module sync settlements from mollie',
     'author': 'Mollie',
@@ -10,7 +10,7 @@
     'license': 'LGPL-3',
     'category': '',
     'depends': [
-        'account'
+        'account_accountant'
     ],
     'data': [
         'views/account_journal.xml',

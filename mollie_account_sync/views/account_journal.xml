@@ -9,7 +9,7 @@
         <field name="arch" type="xml">
             <xpath expr="//page[@name='bank_account']/group" position="inside">
                 <group string="Mollie Configuration " attrs="{'invisible': [('bank_statements_source', '!=', 'mollie_sync')]}">
-                    <field name="mollie_api_key" />
+                    <field name="mollie_api_key" password="True" />
                     <field name="mollie_test" groups="base.group_no_one"/>
                     <field name="mollie_last_sync" readonly="1"/>
                 </group>
@@ -29,6 +29,9 @@
                 </t>
             </xpath>
 
+            <div name="bank_statement_create_button" position='attributes'>
+                <attribute name="t-if">!['mollie_sync', 'mollie_balance_sync'].includes(dashboard.bank_statements_source) </attribute>
+            </div>
         </field>
     </record>
 

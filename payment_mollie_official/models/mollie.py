@@ -124,6 +124,12 @@ class MolliePaymentMethod(models.Model):
 
         return False
 
+    def _get_mollie_method_supported_issuers(self):
+        mollie_issuers = self.env.context.get('mollie_issuers', [])
+        if mollie_issuers.get(self.id):
+            return self.payment_issuer_ids.filtered(lambda issuer: issuer.id in mollie_issuers[self.id])
+        return []
+
 
 class MolliePaymentIssuers(models.Model):
     _name = 'mollie.payment.method.issuer'
@@ -145,16 +151,16 @@ class MollieVoucherLines(models.Model):
     method_id = fields.Many2one('mollie.payment.method', string='Mollie Method')
     category_ids = fields.Many2many('product.category', string='Product Categories')
     product_ids = fields.Many2many('product.template', string='Products')
-    mollie_voucher_category = fields.Selection([('meal', 'Meal'), ('eco', 'Eco'), ('gift', 'Gift')], required=True)
+    mollie_voucher_category = fields.Selection([('meal', 'Meal'), ('eco', 'Eco'), ('gift', 'Gift'), ('consume', 'Consume'), ('sports', 'Sports'), ('additional', 'Additional')], required=True)
 
 
 class ProductTemplate(models.Model):
     _inherit = 'product.template'
 
     def _get_mollie_voucher_category(self):
-        domain = [('product_ids', 'in', self.ids)]
-        categories = self.mapped('categ_id')
+        voucher_lines = self.env['mollie.voucher.line'].search([('product_ids', 'in', self.ids)])
+        categories = (self - voucher_lines.product_ids).mapped('categ_id')
         if categories:
-            domain = expression.OR([domain, [('category_ids', 'parent_of', categories.ids)]])
-        voucher_line = self.env['mollie.voucher.line'].search(domain, limit=1)
-        return voucher_line and voucher_line.mollie_voucher_category or False
+            category_voucher_lines = self.env['mollie.voucher.line'].search([('category_ids', 'in', categories.ids)])
+            voucher_lines |= category_voucher_lines
+        return voucher_lines and voucher_lines.mapped('mollie_voucher_category') or False

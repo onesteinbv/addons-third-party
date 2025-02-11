@@ -10,7 +10,7 @@
     'license': 'LGPL-3',
     'category': '',
     'depends': [
-        'account_accountant'
+        'account'
     ],
     'data': [
         'views/account_journal.xml',

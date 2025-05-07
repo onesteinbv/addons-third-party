@@ -4,7 +4,10 @@ import { registry } from "@web/core/registry";
 const { Component, xml } = owl;
 import { useService } from "@web/core/utils/hooks";
 import { Dialog } from '@web/core/dialog/dialog';
+
 export class MollieJsonDataTable extends Component {
+    static template = "drg_payment_info";
+    static components = { Dialog }
     setup() {
         super.setup();
     }
@@ -16,9 +19,13 @@ export class MollieJsonDataTable extends Component {
         return JSON.parse(this.props.value);
     }
 }
-MollieJsonDataTable.components = { Dialog }
-MollieJsonDataTable.template = 'drg_payment_info';
+
 export class mollieJsonDataComponent extends Component {
+    static template = "mollieAccountSync.mollieJsonDataComponent";
+    static components = {
+        MollieJsonDataTable
+    };
+
     setup() {
         this.dialogs = useService("dialog");
         this.data = JSON.parse(this.props.value);
@@ -28,7 +35,9 @@ export class mollieJsonDataComponent extends Component {
         this.dialogs.add(MollieJsonDataTable, this.props);
     }
 }
-mollieJsonDataComponent.template = "mollieAccountSync.mollieJsonDataComponent";
+
 mollieJsonDataComponent.supportedTypes = ["char"];
-mollieJsonDataComponent.components = ["MollieJsonDataTable"];
-registry.category("fields").add("payment_info", mollieJsonDataComponent);
+
+registry.category("fields").add("payment_info", {
+    component: mollieJsonDataComponent
+});

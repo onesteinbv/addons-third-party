@@ -17,7 +17,9 @@
     'depends': [
         'payment_mollie', 'product', 'account', 'base_automation'
     ],
-    'external_dependencies': {},
+    'external_dependencies': {
+        'python': ['phonenumbers'],
+    },
     'data': [
         'data/cron.xml',
         'security/ir.model.access.csv',

@@ -23,6 +23,7 @@ class AccountMove(models.Model):
     # To proccess refunds from credit notes
 
     valid_for_mollie_refund = fields.Boolean(compute="_compute_valid_for_mollie_refund")
+    # TODO: Deprecated field, not used anywhere, remove in future
     mollie_refund_reference = fields.Char()
 
     def _get_mollie_payment_data_for_refund(self):
@@ -47,7 +48,7 @@ class AccountMove(models.Model):
         self.ensure_one()
 
         # CASE 1: For the credit notes generated from invoice
-        transactions = self.reversed_entry_id.transaction_ids.filtered(lambda tx: tx.state == 'done' and tx.provider_id.code == 'mollie')
+        transactions = self.reversed_entry_id.transaction_ids.filtered(lambda tx: tx.state == 'done' and tx.provider_id.code == 'mollie' and tx.payment_method_id.code != 'pointofsale')
 
         # CASE 2: For the credit note generated due to returns of delivery
         # TODO: In this case credit note is generated from Sale order and so both invoice are not linked as reversal move.

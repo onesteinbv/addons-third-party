@@ -18,7 +18,6 @@
                         <a href="https://www.mollie.com/dashboard/developers/api-keys" target="_new"> Get your API keys <i class="fa fa-arrow-right"></i></a>
                     </b>
                 </small>
-                <field name="mollie_show_save_card" />
                 <field name="mollie_debug_logging" invisible="1"/>
             </field>
 
@@ -27,7 +26,8 @@
             </a>
 
             <a name="action_view_payment_methods" position="after">
-                <a type="object" name="action_sync_mollie" class="btn btn-link" role="button" invisible="code != 'mollie'">
+                <a type="object" name="action_sync_mollie" class="btn btn-link" role="button"
+                    invisible="code != 'mollie' or state == 'disabled'">
                     <i class="fa fa-refresh o_button_icon"/> Sync Mollie Methods
                 </a>
             </a>
@@ -51,16 +51,15 @@
                     </div>
                 </button>
             </xpath>
-            <xpath expr="//group[@name='payment_form']" position="inside">
-                <field name="mollie_auto_capture" invisible="code != 'mollie'" />
-                <field name="mollie_automation_action_id" invisible="1" nolabel="1"/>
-                <label class="o_form_label" for="mollie_automation_action_id" string="Auto update delivered quantity" invisible="code != 'mollie'"/>
-                <div invisible="code != 'mollie'">
-                    <button type="object" class="btn btn-secondary" name="create_delivered_qty_action" invisible="mollie_automation_action_id">Enable</button>
-                    <button type="object" class="btn btn-secondary" name="unlink_delivered_qty_action" invisible="not mollie_automation_action_id">Disable</button>
-                    <br/>
-                    <small class="text-muted">Set delivered quantity in shipping line when delivery Orders are done.</small>
-                </div>
+            <xpath expr="//group[@name='payment_followup']" position="after">
+                <group string="Rounding Adjustment" name="rounding_adjustment"
+                    invisible="code != 'mollie'">
+                    <field name="mollie_rounding_adjustment" />
+                    <field name="rounding_line_description" placeholder="Default: 'Rounding Adjustment'" invisible="not mollie_rounding_adjustment" />
+                    <div colspan="2" class="text-muted small mb-2">
+                        When global rounding is enabled in Odoo, order or invoice totals may differ from the sum of their lines. Enable this option to add a rounding adjustment line on the Mollie side so the payment amount matches exactly. No changes are made in Odoo; the adjustment is handled entirely on the Mollie side.
+                    </div>
+                </group>
             </xpath>
         </field>
     </record>

@@ -6,7 +6,7 @@ import psycopg2
 import requests
 from werkzeug import urls
 
-from odoo import _, fields, models, service, api, SUPERUSER_ID, Command
+from odoo import _, fields, models, service, api, SUPERUSER_ID
 from odoo.exceptions import ValidationError
 from odoo.modules.registry import Registry
 
@@ -19,15 +19,18 @@ class PaymentProviderMollie(models.Model):
 
     # removed required_if_provider becasue we do not want to add production key during testing
     mollie_api_key = fields.Char(string="Mollie API Key", required_if_provider=False, help="The Test or Live API Key depending on the configuration of the provider", groups="base.group_system")
-    mollie_api_key_test = fields.Char(string="Test API key", groups="base.group_user")
-    mollie_profile_id = fields.Char("Mollie Profile ID", groups="base.group_user")
+    mollie_api_key_test = fields.Char(string="Test API key", groups="base.group_system")
+    mollie_profile_id = fields.Char("Mollie Profile ID", groups="base.group_system")
 
     mollie_use_components = fields.Boolean(string='Mollie Components', default=True)
-    mollie_show_save_card = fields.Boolean(string='Single-Click payments')
     mollie_debug_logging = fields.Boolean('Debug logging', help="Log requests in order to ease debugging")
+
+    # TODO: Deprecated field, not used anywhere, removed in future
     mollie_auto_capture = fields.Boolean('Auto Capture')
     mollie_set_delivery_line_qty = fields.Boolean('Set Delivery Line Qty')
     mollie_automation_action_id = fields.Many2one('base.automation', string='Automation Action')
+    mollie_rounding_adjustment = fields.Boolean(string="Rounding Adjustment")
+    rounding_line_description = fields.Char(string="Rounding Line Description", translate=True)
 
     def toggle_mollie_debug(self):
         for provider in self:
@@ -54,38 +57,6 @@ class PaymentProviderMollie(models.Model):
             except psycopg2.Error:
                 pass
 
-    # -----------------
-    # AUTOMATION ACTION
-    # -----------------
-
-    def create_delivered_qty_action(self):
-        if self.env.ref('base.module_stock').state != 'installed':
-            raise ValidationError('Install "Inventory" module for automatically set delivered quantity.')
-        picking_model_id = self.env.ref('stock.model_stock_picking').id
-        self.mollie_automation_action_id = self.env['base.automation'].create({
-            'name': 'Set Shipping line Delivered Quantity',
-            'active': True,
-            'trigger': 'on_create_or_write',
-            'filter_pre_domain': "['&', ('picking_type_code', '=', 'outgoing'), ('state', '!=', 'done')]",
-            'filter_domain': "['&', ('picking_type_code', '=', 'outgoing'), ('state', '=', 'done')]",
-            'model_id': picking_model_id,
-            'action_server_ids': [Command.create({
-                'name': 'Test',
-                'state': 'code',
-                'model_id': picking_model_id,
-                'code': """
-for transfer in records:
-    delivery_line = transfer.sale_id.order_line.filtered(lambda line:line.is_delivery and not line.qty_delivered)
-    if delivery_line and delivery_line.product_id.service_type == 'manual':
-        delivery_line.write({'qty_delivered': 1})
-"""
-            })]
-        }).id
-
-    def unlink_delivered_qty_action(self):
-        if self.mollie_automation_action_id:
-            self.mollie_automation_action_id.unlink()
-
     # ----------------
     # PAYMENT FEATURES
     # ----------------
@@ -96,6 +67,7 @@ for transfer in records:
         self.filtered(lambda p: p.code == 'mollie').update({
             'support_refund': 'partial',
             'support_manual_capture': 'partial',
+            'support_tokenization': True,
         })
 
     # --------------
@@ -105,8 +77,16 @@ for transfer in records:
     def action_sync_mollie(self):
         """ This method will sync mollie methods and translations via API """
         self.ensure_one()
-        self.env['payment.method']._sync_mollie_methods(self)
-
+        return {
+            'type': 'ir.actions.act_window',
+            'name': 'Sync Mollie Payment Methods',
+            'res_model': 'mollie.sync.wizard',
+            'view_mode': 'form',
+            'target': 'new',
+            'context': {
+                'default_provider_id': self.id,
+            }
+        }
     # -----------
     # API methods
     # -----------
@@ -152,7 +132,7 @@ for transfer in records:
 
         try:
             response = requests.request(method, url, params=querystring_params, data=json_data, headers=headers, timeout=60)
-            if response.status_code == 204:
+            if response.status_code in [204, 202]:
                 return True  # returned no content
             result = response.json()
             if response.status_code not in [200, 201]:  # doc reference https://docs.mollie.com/overview/handling-errors
@@ -194,16 +174,14 @@ for transfer in records:
                 result[method['id']] = method
         return result
 
-    def _api_mollie_create_payment_record(self, api_type, payment_data, params=None, silent_errors=False):
-        """ Create the payment records on the mollie. It calls payment or order
-        API based on 'api_type' param.
+    def _api_mollie_create_payment_record(self, payment_data, params=None, silent_errors=False):
+        """ Create the payment records on the mollie.
         :param str api_type: api is selected based on this parameter
         :param dict payment_data: payment data
         :return: details of created payment record
         :rtype: dict
         """
-        endpoint = '/orders' if api_type == 'order' else '/payments'
-        return self._mollie_make_request(endpoint, data=payment_data, params=params, method="POST", silent_errors=silent_errors)
+        return self._mollie_make_request('/payments', data=payment_data, params=params, method="POST", silent_errors=silent_errors)
 
     def _api_mollie_get_payment_data(self, transaction_reference, force_payment=False):
         """ Fetch the payment records based `transaction_reference`. It is used
@@ -213,6 +191,8 @@ for transfer in records:
         :rtype: dict
         """
         mollie_data = {}
+
+        # Order API deprecated remove the order support in future version
         if transaction_reference.startswith('ord_'):
             mollie_data = self._mollie_make_request(f'/orders/{transaction_reference}', params={'embed': 'payments'}, method="GET")
         if transaction_reference.startswith('tr_'):    # This is not used
@@ -275,23 +255,20 @@ for transfer in records:
         """
         return self._mollie_make_request(f'/payments/{payment_reference}/captures', method="GET")
 
-    def _api_mollie_sync_shipment(self, order_reference, shipment_data):
+    def _api_mollie_sync_capture(self, order_reference, capture_data):
         """ Capture amount from mollie
-        update delivered quantity
         :param str order_reference: order record reference
-        :param dict payment_data: delivered quantity data
+        :param dict capture_data: captured amount data
 
         """
-        return self._mollie_make_request(f'/orders/{order_reference}/shipments', data=shipment_data, method="POST", silent_errors=True)
+        return self._mollie_make_request(f'/payments/{order_reference}/captures', data=capture_data, method="POST")
 
-    def _api_mollie_cancel_remaining_shipment(self, order_reference, data):
-        """ cancel remaining shipment on the mollie.
+    def _api_mollie_void_remaining_payment(self, order_reference):
+        """ Void remaining amount from mollie
         :param str order_reference: order record reference
-        :param dict data: shipment data for cancel.
-        :return: details of Order
-        :rtype: dict
+
         """
-        return self._mollie_make_request(f'/orders/{order_reference}/lines', data=data, method="DELETE", silent_errors=True)
+        return self._mollie_make_request(f'/payments/{order_reference}/release-authorization', method="POST")
 
     # -------------------------
     # Helper methods for mollie
@@ -338,3 +315,43 @@ for transfer in records:
         :rtype: list
         """
         return self.search([('code', '=', 'mollie')]).with_context(active_test=False).mapped('payment_method_ids.code')
+
+    def _mollie_get_customer_id(self, partner):
+        """ Get or create a Mollie customer ID for the given partner.
+
+        Checks existing payment.token records from Mollie for the partner to
+        retrieve a customer ID. Validates it via API and creates a new one if
+        no valid ID is found.
+
+        :param recordset partner: res.partner record
+        :return: Mollie customer ID or False
+        :rtype: str or False
+        """
+        self.ensure_one()
+        existing_token = self.env['payment.token'].sudo().search([
+            ('partner_id', '=', partner.id),
+            ('provider_id', '=', self.id),
+            ('company_id', '=', self.company_id.id),
+            ('mollie_customer_id', '!=', False),
+        ], limit=1, order='create_date desc')
+
+        if existing_token and self._mollie_validate_customer_id(existing_token.mollie_customer_id):
+            return existing_token.mollie_customer_id
+
+        customer_data = self._api_mollie_create_customer_id()
+        if customer_data and customer_data.get('id'):
+            return customer_data['id']
+        return False
+
+    def _mollie_validate_customer_id(self, customer_id):
+        """ Validate a Mollie customer ID via API.
+
+        :param str customer_id: Mollie customer ID to validate
+        :return: True if valid, False if deleted/invalid
+        :rtype: bool
+        """
+        self.ensure_one()
+        customer_data = self._api_get_customer_data(customer_id, silent_errors=True)
+        if not customer_data or customer_data.get('status'):
+            return False
+        return True

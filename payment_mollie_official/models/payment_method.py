@@ -115,50 +115,91 @@ class PaymentMethod(models.Model):
             provider_ids, partner_id, currency_id=currency_id, force_tokenization=force_tokenization,
             is_express_checkout=is_express_checkout, report=report, **kwargs
         )
-
         if not provider_ids:
-            return result_pms
-
-        # all active mollie methods from provider
-        mollie_providers = self.env['payment.provider'].browse(provider_ids).filtered(lambda provider: provider._get_code() == 'mollie')
-        mollie_active_pms = mollie_providers.mapped('payment_method_ids')
-
-        if not mollie_providers:
             return result_pms
 
         def is_mollie_method(method):
             return method.provider_ids.filtered(lambda p: p.id in provider_ids)[:1]._get_code() == 'mollie'
 
-        # mollie methods from super
+        mollie_providers = self.env['payment.provider'].browse(provider_ids).filtered(lambda provider: provider._get_code() == 'mollie')
         mollie_result_pms = result_pms.filtered(lambda m: is_mollie_method(m))
+
+        if not mollie_result_pms:
+            return result_pms
+
+        # mollie methods from super
         non_mollie_pms = result_pms - mollie_result_pms
 
         # mollie methods from which we need to filter via method api
-        mollie_allowed_methods = mollie_active_pms - non_mollie_pms
+        mollie_allowed_methods = mollie_result_pms
 
         # Fetch allowed methods via API
         has_voucher_line, extra_params = False, {'includeWallets': 'applepay'}
+
+        is_partial_payment = False
+
         if kwargs.get('sale_order_id'):
             order_sudo = self.env['sale.order'].browse(kwargs['sale_order_id']).sudo()
-            extra_params['amount'] = {'value': "%.2f" % order_sudo.amount_total, 'currency': order_sudo.currency_id.name}
+
+            # payment_amount attribute is sent when user is paying via payment links. In that case payment amount is different than order amount.
+            payment_amount = float(request.params.get('amount')) if request.params.get('amount') else False
+            extra_params['amount'] = {'value': "%.2f" % (payment_amount or order_sudo.amount_total), 'currency': order_sudo.currency_id.name}
+
             if order_sudo.partner_invoice_id.country_id:
                 extra_params['billingCountry'] = order_sudo.partner_invoice_id.country_id.code
+
+            # ------------------ Check for partial payment ------------------
+
+
+            # downpayment attribute is sent when user use downpayment option to pay partial amount.
+            is_downpayment = False
+
+            # if payment_amount is that means it is payment link or partial payment via downpayment option
+            if payment_amount:
+                if payment_amount < order_sudo.amount_total:
+                    is_partial_payment = True
+
+            # sent when downpayent option manually selected in portal
+            downpayment_selection = request.params.get('downpayment') if request else None
+            if downpayment_selection == 'true':
+                is_downpayment = True
+                is_partial_payment = True
+            elif downpayment_selection == 'false' and payment_amount != order_sudo.amount_total:
+                extra_params['amount'] = {'value': "%.2f" % (order_sudo.amount_total), 'currency': order_sudo.currency_id.name} # reset payment amount to full amount
+                is_partial_payment = False
+
+            # Default case for partial payment (when portal page is loaded first time)
+            needs_prepayment = order_sudo.prepayment_percent and order_sudo.prepayment_percent != 1.0
+            if not payment_amount and not downpayment_selection and needs_prepayment:
+                is_partial_payment = True
+                is_downpayment = True
+
             has_voucher_line = order_sudo.mapped('order_line.product_id.product_tmpl_id')._get_mollie_voucher_category()
 
-            # we will not use order api if it is downpayment also we will user downpayment amount
-            if request and request.params.get('downpayment') == 'true':
+            if is_downpayment:
                 extra_params['amount'] = {'value': "%.2f" % order_sudo._get_prepayment_required_amount(), 'currency': order_sudo.currency_id.name}
-            elif all(line.product_uom_qty % 1 == 0 for line in order_sudo.order_line):
-                extra_params['resource'] = 'orders'
 
-        if not kwargs.get('sale_order_id') and request and request.params.get('invoice_id'):
+        elif request and request.params.get('invoice_id'):
             invoice_id = request.params.get('invoice_id')
             invoice = self.env['account.move'].sudo().browse(int(invoice_id))
+
             amount_payment_link = float(request.params.get('amount', '0'))  # for payment links
             if invoice.exists():
                 extra_params['amount'] = {'value': "%.2f" % (amount_payment_link or invoice.amount_residual), 'currency': invoice.currency_id.name}
                 if invoice.partner_id.country_id:
                     extra_params['billingCountry'] = invoice.partner_id.country_id.code
+
+                if (amount_payment_link and invoice.amount_total != amount_payment_link) or invoice.amount_total != invoice.amount_residual:
+                    is_partial_payment = True
+        elif request and request.params.get('pos_order_id'):
+            order_sudo = self.env['pos.order'].browse(request.params.get('pos_order_id')).sudo()
+            extra_params['amount'] = {'value': "%.2f" % (order_sudo.amount_total), 'currency': order_sudo.currency_id.name}
+
+        elif 'amount' not in extra_params and force_tokenization:
+            extra_params['amount'] = {'value': "0.00", 'currency': self.env.company.currency_id.name}
+
+        if force_tokenization:
+            mollie_allowed_methods = mollie_allowed_methods.filtered(lambda m: m.code in const.MANDATE_METHODS)
 
         partner = self.env['res.partner'].browse(partner_id)
         if not extra_params.get('billingCountry') and partner.country_id:
@@ -171,7 +212,14 @@ class PaymentMethod(models.Model):
 
         # Hide methods if mollie does not supports them (checks via api call)
         supported_methods = mollie_providers[:1]._api_mollie_get_active_payment_methods(extra_params=extra_params)  # sudo as public user do not have access to keys
-        mollie_allowed_methods = mollie_allowed_methods.filtered(lambda m: const.PAYMENT_METHODS_MAPPING.get(m.code, m.code) in supported_methods.keys())
+
+        mollie_allowed_methods = mollie_allowed_methods.filtered(
+            lambda m: (
+                const.PAYMENT_METHODS_MAPPING.get(m.code, m.code) in supported_methods.keys() and
+                (not is_partial_payment or (is_partial_payment and m.code not in const.NON_PARTIAL_PAYMENT_METHODS))
+            )
+        )
+
         mollie_issuers = {}
         for method, method_data in supported_methods.items():
             issuers = method_data.get('issuers')
@@ -203,7 +251,7 @@ class PaymentMethod(models.Model):
         inline_form_xml_id = original_xml_id
         if provider_sudo._get_code() == 'mollie':
             # TODO: map word creditcard with PAYMENT_METHODS_MAPPING
-            if self.code == 'card' and (provider_sudo.mollie_use_components or provider_sudo.mollie_show_save_card):    # inline card
+            if self.code == 'card' and provider_sudo.mollie_use_components:    # inline card
                 inline_form_xml_id = 'payment_mollie_official.mollie_creditcard_component'
             # elif self.mollie_has_issuers:  # Issuers
             elif self.mollie_has_issuers and self.code != 'ideal':  # Issuers is removed for ideal as mollie does not support issuers anymore
@@ -225,6 +273,16 @@ class PaymentMethod(models.Model):
         for odoo_method_code, mollie_method_code in const.PAYMENT_METHODS_MAPPING.items():
             if mollie_methods_data.get(mollie_method_code):
                 mollie_methods_data[odoo_method_code] = mollie_methods_data.pop(mollie_method_code)
+
+        # Reload Metadata
+        if self.env.context.get('reload_metadata'):
+            for method_code, method_info in mollie_methods_data.items():
+                mollie_method = all_methods.filtered(lambda m: m.code == method_code)
+                mollie_method.write({
+                    'name': method_info['description'],
+                    'image': self._mollie_fetch_image_by_url(method_info.get('image', {}).get('size2x')),
+                })
+            return
 
         # Create new methods if needed
         methods_to_create = mollie_methods_data.keys() - set(all_methods.mapped('code'))

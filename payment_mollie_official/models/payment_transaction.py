@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 
+import pprint
 import logging
 import phonenumbers
 from werkzeug import urls
 
 from odoo.addons.payment_mollie_official import const
 from odoo.addons.payment_mollie.controllers.main import MollieController
-from odoo.exceptions import ValidationError
-from odoo.tools import float_compare
+from odoo.exceptions import ValidationError, UserError
 
 from odoo import _, api, fields, models, tools
 
@@ -19,9 +19,10 @@ class PaymentTransaction(models.Model):
 
     mollie_payment_issuer = fields.Char()
     mollie_card_token = fields.Char()
-    mollie_save_card = fields.Boolean()
     mollie_reminder_payment_id = fields.Many2one('account.payment', string="Mollie Reminder Payment", readonly=True)
     mollie_origin_payment_reference = fields.Char()
+
+    # Order Deprecated, will be removed in future
     mollie_payment_shipment_reference = fields.Char()
 
     def _process_notification_data(self, notification_data):
@@ -41,20 +42,24 @@ class PaymentTransaction(models.Model):
             return
 
         provider_reference = self.provider_reference
+
         mollie_payment = self.provider_id._api_mollie_get_payment_data(provider_reference, force_payment=True)
         payment_status = mollie_payment.get('status')
 
         if mollie_payment.get('amountCaptured') and float(mollie_payment['amountCaptured']['value']) > 0.0:
-            self._process_capture_transactions_status(mollie_payment['id'])
+            self._process_capture_transactions_status(mollie_payment['id'], payment_status)
             if payment_status != 'paid' or payment_status == 'paid' and self.state == 'done':
                 return
-
         if payment_status == 'paid':
             self._set_done()
+            if self.tokenize and not self.token_id:
+                self._mollie_tokenize_from_notification_data(mollie_payment)
         elif payment_status == 'pending':
             self._set_pending()
         elif payment_status == 'authorized':
             self._set_authorized()
+            if self.tokenize and not self.token_id:
+                self._mollie_tokenize_from_notification_data(mollie_payment)
         elif payment_status in ['expired', 'canceled', 'failed']:
             self._set_canceled("Mollie: " + _("Mollie: canceled due to status: %s", payment_status))
         elif payment_status == 'open':
@@ -62,6 +67,40 @@ class PaymentTransaction(models.Model):
         else:
             _logger.info("Received data with invalid payment status: %s", payment_status)
             self._set_error("Mollie: " + _("Received data with invalid payment status: %s", payment_status))
+
+    def _mollie_tokenize_from_notification_data(self, payment_data):
+        """ Create a new token based on the notification data.
+
+        Note: self.ensure_one()
+
+        :param dict notification_data: The notification data sent by the provider
+        :return: None
+        """
+        self.ensure_one()
+        if 'customerId' not in payment_data or 'mandateId' not in payment_data:
+            return
+
+        token = self.env['payment.token'].create({
+            'provider_id': self.provider_id.id,
+            'payment_method_id': self.payment_method_id.id,
+            'payment_details': payment_data.get('details', {}).get('cardNumber', False),
+            'partner_id': self.partner_id.id,
+            'provider_ref': payment_data.get('mandateId'),
+            'mollie_customer_id': payment_data.get('customerId'),
+        })
+        self.write({
+            'token_id': token,
+            'tokenize': False,
+        })
+        _logger.info(
+            "Created token with id %(token_id)s for partner with id %(partner_id)s from "
+            "transaction with reference %(ref)s",
+            {
+                'token_id': token.id,
+                'partner_id': self.partner_id.id,
+                'ref': self.reference,
+            },
+        )
 
     def _get_specific_rendering_values(self, processing_values):
         """ Override of payment to return Mollie-specific rendering values.
@@ -75,7 +114,7 @@ class PaymentTransaction(models.Model):
         if self.provider_code != 'mollie':
             return super()._get_specific_rendering_values(processing_values)
 
-        payment_data = self._create_mollie_order_or_payment()
+        payment_data = self._mollie_create_payment_record()
 
         # if checkout links are not present means payment has been done via card token
         # and there is no need to checkout on mollie
@@ -88,6 +127,22 @@ class PaymentTransaction(models.Model):
                 'api_url': payment_data.get('redirectUrl'),
                 'ref': self.reference
             }
+
+    def _send_payment_request(self):
+        """Override of `payment` to send a payment request to Mollie."""
+        if self.provider_code != 'mollie':
+            return super()._send_payment_request()
+
+        # Prepare the payment request to Mollie.
+        if not self.token_id:
+            raise UserError("Mollie: " + _("The transaction is not linked to a token."))
+
+        # Send the payment request to Mollie.
+        payment_data = self._mollie_create_payment_record()
+        if not payment_data:  # The payment data might be missing if Mollie failed to create it.
+            return  # There is nothing to process; the transaction is in error at this point.
+
+        self._handle_notification_data('mollie', payment_data)
 
     def _send_refund_request(self, amount_to_refund=None):
         """ Override of payment to send a refund request to Authorize.
@@ -103,10 +158,16 @@ class PaymentTransaction(models.Model):
         if self.provider_code != 'mollie':
             return refund_tx
 
-        payment_data = self.provider_id._api_mollie_get_payment_data(self.provider_reference, force_payment=True)
+        provider_reference = self.provider_reference
+        if self.provider_reference.startswith('cpt_'):
+            provider_reference = self.source_transaction_id.provider_reference
+        payment_data = self.provider_id._api_mollie_get_payment_data(provider_reference, force_payment=True)
         refund_data = self.provider_id._api_mollie_refund(amount_to_refund, self.currency_id.name, payment_data.get('id'))
         refund_tx.provider_reference = refund_data.get('id')
-
+        refund_tx.source_transaction_id._handle_notification_data('mollie', payment_data)
+        if self.env.context.get('dr_refund_wizard'):
+            refund_wizard = self.env['payment.refund.wizard'].sudo().browse(self.env.context.get('dr_refund_wizard'))
+            refund_wizard.payment_id.mollie_refund_reference = refund_tx.id
         return refund_tx
 
     def _get_tx_from_notification_data(self, provider_code, notification_data):
@@ -123,6 +184,32 @@ class PaymentTransaction(models.Model):
                 ))
         return tx
 
+    def _send_capture_request(self, amount_to_capture=None):
+        """ Override of `payment` to send a capture request to Mollie. """
+        child_capture_tx = super()._send_capture_request(amount_to_capture=amount_to_capture)
+        if self.provider_code != 'mollie':
+            return child_capture_tx
+
+        # Make the capture request to Mollie
+        capture_values = {
+            'amount': {
+                'currency': self.currency_id.name,
+                'value': "%.2f" % amount_to_capture
+            },
+        }
+        if self.amount != amount_to_capture and self.payment_method_code not in const.MULTI_CAPTURE_METHODS:
+            # For payment methods that require full amount capture only, raise error for partial captures
+            raise UserError(_('%s does not support partial captures. Please capture the full amount.'%(self.payment_method_id.name)))
+        payment_data = self.provider_id._api_mollie_sync_capture(self.provider_reference, capture_values)
+        _logger.info(
+            "capture request response for transaction with reference %s:\n%s",
+            self.reference, pprint.pformat(payment_data)
+        )
+        if child_capture_tx:
+            child_capture_tx.provider_reference = payment_data.get('id')
+
+        return child_capture_tx
+
     def _send_void_request(self, amount_to_void=None):
         """ transaction to void the payment
         cancel remaining quantity
@@ -134,31 +221,21 @@ class PaymentTransaction(models.Model):
         child_void_tx = super()._send_void_request(amount_to_void=amount_to_void)
         if self.provider_code != 'mollie':
             return child_void_tx
-
-        data = self.provider_id._api_mollie_get_payment_data(self.provider_reference)
-        cancel_lines = []
-        cancelable_amount = 0
-        if data and data.get('lines'):
-            for mollie_line in data.get('lines'):
-                if mollie_line.get('status') == 'canceled' or not mollie_line.get('isCancelable'):
-                    continue
-                mollie_line_metadata = mollie_line.get('metadata')
-                if mollie_line_metadata:
-                    order_line = self.sale_order_ids.order_line.filtered(lambda line: line.id == mollie_line_metadata.get('line_id'))
-                    if order_line:
-                        cancelable_amount += order_line.price_reduce_taxinc * mollie_line['cancelableQuantity']
-                        cancel_lines.append({
-                            'id': mollie_line['id'],
-                        })
-
-        if cancel_lines and cancelable_amount:
-            self.provider_id._api_mollie_cancel_remaining_shipment(self.provider_reference, {'lines': cancel_lines})
-
-        if not child_void_tx and cancelable_amount:
-            child_void_tx = self._create_child_transaction(cancelable_amount)
-
-        child_void_tx._set_canceled()
+        payment_data = self.provider_id._api_mollie_void_remaining_payment(self.provider_reference)
+        _logger.info(
+            "void request response for transaction with reference %s:\n%s",
+            self.reference, pprint.pformat(payment_data)
+        )
+        if child_void_tx and payment_data:
+            child_void_tx._set_canceled()
         return child_void_tx
+
+    def _create_child_transaction(self, amount, is_refund=False, **custom_create_values):
+        """ Inherit this method to create a refund transaction linked to the source payment transaction
+            when the refund is processed from a captured transaction. """
+        if self.provider_id.code == 'mollie' and is_refund and self.provider_reference.startswith('cpt_'):
+            return self.source_transaction_id._create_child_transaction(amount, is_refund, **custom_create_values)
+        return super()._create_child_transaction(amount, is_refund, **custom_create_values)
 
     def _create_payment(self, **extra_create_values):
         """ Overridden method to create reminder payment for vouchers."""
@@ -242,46 +319,16 @@ class PaymentTransaction(models.Model):
             )
         return message
 
-    def _create_mollie_order_or_payment(self):
-        """ In order to capture payment from mollie we need to create a record on mollie.
-
-        Mollie have 2 type of api to create payment record,
-         * order api (used for sales orders)
-         * payment api (used for invoices and other payments)
-
-        Different methods suppports diffrent api we choose the api based on that. Also
-        we have used payment api as fallback api if order api fails.
-
-        Note: self.ensure_one()
-
-        :return: None
-        """
-        self.ensure_one()
-        method_record = self.payment_method_id
-
-        result = None
-
-        # Order API (use if sale orders are present). Also qr code is only supported by Payment API
-        # Any quantity value is float use payment API
-        # we do float_compare as partial payments is now possible.
-        if (not method_record.mollie_enable_qr_payment) and 'sale_order_ids' in self._fields and len(self.sale_order_ids) == 1 and \
-                float_compare(self.sale_order_ids.amount_total, self.amount, precision_digits=2) == 0 and \
-                all(line.product_uom_qty % 1 == 0 for line in self.sale_order_ids.order_line):
-            # Order API
-            result = self._mollie_create_payment_record('order')
-        else:  # Payment API
-            result = self._mollie_create_payment_record('payment')
-        return result
-
-    def _mollie_create_payment_record(self, api_type, silent_errors=False):
+    def _mollie_create_payment_record(self, silent_errors=False):
         """ This method payment/order record in mollie based on api type.
 
         :param str api_type: api is selected based on this parameter
         :return: data of created record received from mollie api
         :rtype: dict
         """
-        payment_data, params = self._mollie_prepare_payment_payload(api_type)
-        result = self.provider_id._api_mollie_create_payment_record(api_type, payment_data, params=params, silent_errors=silent_errors)
+        self.ensure_one()
+        payment_data, params = self._mollie_prepare_payment_payload()
+        result = self.provider_id._api_mollie_create_payment_record(payment_data, params=params, silent_errors=silent_errors)
 
         # We are setting provider reference as we are receiving it before 3DS payment
         # So we can verify the validity of the transecion
@@ -289,7 +336,7 @@ class PaymentTransaction(models.Model):
             self.provider_reference = result.get('id')
         return result
 
-    def _mollie_prepare_payment_payload(self, api_type):
+    def _mollie_prepare_payment_payload(self):
         """ This method prepare the payload based in api type.
 
         Note: this method are splitted so we can write test cases
@@ -316,18 +363,43 @@ class PaymentTransaction(models.Model):
             'locale': self.provider_id._mollie_user_locale(),
             'redirectUrl': f'{redirect_url}?ref={self.reference}'
         }
+        provider = self.provider_id
 
-        if api_type == 'order':
-            # Order api parameters
-            order = self.sale_order_ids[0]
+        if provider.capture_manually and payment_data.get('method') in const.CAPTURE_METHODS:
+            payment_data['captureMode'] = 'manual'
+
+        payment_data.update({
+            'description': self.reference,
+        })
+
+        if self.invoice_ids:
+            invoice = self.invoice_ids[0]
+            invoice_total = invoice.amount_total
+            lines = []
+            if self.amount == invoice_total:
+                lines = self._mollie_get_invoice_lines(invoice)
+
             payment_data.update({
-                'billingAddress': self._prepare_mollie_address(),
-                'orderNumber': f'{_("Sale Order")} ({self.reference})',
-                'lines': self._mollie_get_order_lines(order),
+                'lines': lines
+            })
+
+        if self.sale_order_ids:
+            order = self.sale_order_ids[0]
+            order_total = order.amount_total
+            lines = []
+
+            if self.amount == order_total:
+                lines = self._mollie_get_order_lines(order)
+
+            payment_data.update({
+                'lines': lines,
             })
         else:
             # Payment api parameters
             payment_data['description'] = self.reference
+
+        if (self.invoice_ids or self.sale_order_ids) and self.payment_method_code in const.BILLING_ADDRESS_REQUIRED_METHODS:
+            payment_data['billingAddress'] = self._prepare_mollie_address()
 
         # Mollie rejects some local ips/URLs
         # https://help.mollie.com/hc/en-us/articles/213470409
@@ -340,33 +412,32 @@ class PaymentTransaction(models.Model):
         if self.mollie_card_token:
             method_specific_parameters['cardToken'] = self.mollie_card_token
 
-        # Add if transaction has save card option
-        if self.mollie_save_card and not self.env.user.has_group('base.group_public'):  # for security
-            user_sudo = self.env.user.sudo()
-            user_sudo._mollie_validate_customer_id(self.provider_id)    # check customer ID exist else delete it (we will generate new one)
-            mollie_customer_id = user_sudo.mollie_customer_id
-            if not mollie_customer_id:
-                customer_id_data = self.provider_id._api_mollie_create_customer_id()
-                if customer_id_data and customer_id_data.get('id'):
-                    user_sudo.mollie_customer_id = customer_id_data.get('id')
-                    mollie_customer_id = user_sudo.mollie_customer_id
+        if self.tokenize and not self.env.user.has_group('base.group_public') and self.payment_method_code in const.MANDATE_METHODS:
+            mollie_customer_id = self.provider_id._mollie_get_customer_id(self.partner_id)
             if mollie_customer_id:
-                method_specific_parameters['customerId'] = mollie_customer_id
+                method_specific_parameters.update({
+                    "customerId": mollie_customer_id,
+                    "sequenceType": "first",
+                })
+                if payment_data.get('captureMode') == 'manual':
+                    del payment_data['captureMode']
 
         # Add if transaction has issuer
         if self.mollie_payment_issuer:
             method_specific_parameters['issuer'] = self.mollie_payment_issuer
 
-        # Based on api_type pass the method_specific_parameters
-        if api_type == 'order':
-            payment_data['payment'] = method_specific_parameters
-            if payment_data.get('webhookUrl'):
-                payment_data['payment']['webhookUrl'] = payment_data['webhookUrl']    # To get refund webhook
-        else:
-            payment_data.update(method_specific_parameters)
-            method_record = self.provider_id.payment_method_ids.filtered(lambda m: m.code == self.payment_method_id.code)
-            if method_record.mollie_enable_qr_payment:
-                params['include'] = 'details.qrCode'
+        payment_data.update(method_specific_parameters)
+        if self.token_id:
+            payment_data.update({
+                "customerId": self.token_id.mollie_customer_id,
+                "mandateId": self.token_id.provider_ref,
+                "sequenceType": "recurring",
+            })
+            payment_data.pop("method")
+
+        method_record = self.provider_id.payment_method_ids.filtered(lambda m: m.code == self.payment_method_id.code)
+        if method_record.mollie_enable_qr_payment:
+            params['include'] = 'details.qrCode'
         return payment_data, params
 
     def _mollie_get_order_lines(self, order):
@@ -377,48 +448,122 @@ class PaymentTransaction(models.Model):
         :rtype: dict
         """
         lines = []
+        lines_amount_total = 0.0
         for line in order.order_line.filtered(lambda l: not l.display_type):  # ignore notes and section lines
+            if line.price_total == 0:
+                continue
+            line_type = 'physical'
+            is_negative_line = line.price_total < 0
+            quantity = int(abs(line.product_uom_qty))
+            unit_price = abs(line.price_reduce_taxinc)
+            if not line.product_uom_qty.is_integer():
+                quantity = 1  # Mollie does not support float quantities.
+                unit_price = abs(line.price_total)
+            if is_negative_line:
+                line_type = 'discount'
+                unit_price = -abs(unit_price)
+            lines_amount_total += line.price_total
             line_data = {
-                'name': line.name,
-                'type': 'physical',
-                'quantity': int(line.product_uom_qty),    # Mollie does not support float.
+                'description': line.name,
+                'type': line_type,
+                'quantity': quantity,
                 'unitPrice': {
                     'currency': line.currency_id.name,
-                    'value': "%.2f" % line.price_reduce_taxinc
+                    'value': "%.2f" % unit_price,
                 },
                 'totalAmount': {
                     'currency': line.currency_id.name,
                     'value': "%.2f" % line.price_total,
                 },
-                'vatRate': "%.2f" % sum(line.tax_id.mapped('amount')),
-                'vatAmount': {
-                    'currency': line.currency_id.name,
-                    'value': "%.2f" % line.price_tax,
-                }
             }
-            if line.product_id.type == 'service':
+            if line.product_id.type == 'service' and line_type != 'discount':
                 line_data['type'] = 'digital'  # We are considering service product as digital as we don't do shipping for it.
 
-            if 'is_delivery' in line._fields and line.is_delivery:
+            if 'is_delivery' in line._fields and line.is_delivery and line_type != 'discount':
                 line_data['type'] = 'shipping_fee'
 
             if line.product_id and 'website_url' in line.product_id._fields:
                 base_url = self.get_base_url()
                 line_data['productUrl'] = urls.url_join(base_url, line.product_id.website_url)
 
-            line_data['metadata'] = {
-                'line_id': line.id,
-                'product_id': line.product_id.id
-            }
             if self.payment_method_id.code == 'voucher':
                 category = line.product_id.product_tmpl_id._get_mollie_voucher_category()
                 if category:
                     line_data.update({
-                        'category': category[0]
+                        'categories': category
                     })
             lines.append(line_data)
-
+        if self.provider_id.mollie_rounding_adjustment:
+            self._prepare_rounding_adjustment_line(order, lines, lines_amount_total)
         return lines
+
+    def _mollie_get_invoice_lines(self, invoice):
+        """
+        Format invoice lines for Mollie's order API.
+
+        :param invoice: account.move record
+        :return: List of dicts representing Mollie-compatible invoice lines
+        """
+        lines = []
+        lines_amount_total = 0.00
+        for line in invoice.invoice_line_ids.filtered(lambda l: l.display_type not in ['line_section', 'line_note']):
+            if line.price_total == 0:
+                continue
+            line_type = 'physical'
+            is_negative_line = line.price_total < 0
+            quantity = int(abs(line.quantity)) or 1
+            unit_price = abs(line.price_total / quantity)
+            if not line.quantity.is_integer():
+                quantity = 1  # Mollie does not support float quantities.
+                unit_price = abs(line.price_total)
+            if is_negative_line:
+                line_type = 'discount'
+                unit_price = -abs(unit_price)
+            lines_amount_total += line.price_total
+
+            line_data = {
+                'description': line.name,
+                'type': line_type,
+                'quantity': quantity,
+                'quantityUnit': line.product_uom_id.name or 'pcs',
+                'unitPrice': {
+                    'currency': line.currency_id.name,
+                    'value': f"{unit_price:.2f}",
+                },
+                'totalAmount': {
+                    'currency': line.currency_id.name,
+                    'value': f"{line.price_total:.2f}",
+                }
+            }
+
+            if line.product_id and 'website_url' in line.product_id._fields:
+                base_url = self.get_base_url()
+                line_data['productUrl'] = urls.url_join(base_url, line.product_id.website_url)
+
+            lines.append(line_data)
+        if self.provider_id.mollie_rounding_adjustment:
+            self._prepare_rounding_adjustment_line(invoice, lines, lines_amount_total)
+        return lines
+
+    def _prepare_rounding_adjustment_line(self, record, lines, lines_amount_total):
+        lines_amount_total = record.currency_id.round(lines_amount_total)
+        rounding_difference = record.currency_id.round(self.amount - lines_amount_total)
+        if rounding_difference != 0:
+            rounding_line_type = 'digital' if rounding_difference > 0 else 'discount'
+            line_data = {
+                'description': self.provider_id.rounding_line_description or _("Rounding Adjustment"),
+                'type': rounding_line_type,
+                'quantity': 1,
+                'unitPrice': {
+                    'currency': record.currency_id.name,
+                    'value': "%.2f" % rounding_difference,
+                },
+                'totalAmount': {
+                    'currency': record.currency_id.name,
+                    'value': "%.2f" % rounding_difference,
+                },
+            }
+            lines.append(line_data)
 
     def _prepare_mollie_address(self):
         """ This method prepare address used in order api of mollie
@@ -460,10 +605,9 @@ class PaymentTransaction(models.Model):
     @api.model
     def _mollie_phone_format(self, phone):
         """ Mollie only allows E164 phone numbers so this method checks whether its validity."""
-        phone = False
         if phone:
             try:
-                parse_phone = phonenumbers.parse(self.phone, None)
+                parse_phone = phonenumbers.parse(phone, None)
                 if parse_phone:
                     phone = phonenumbers.format_number(
                         parse_phone, phonenumbers.PhoneNumberFormat.E164
@@ -478,48 +622,70 @@ class PaymentTransaction(models.Model):
         for transection in refund_transactions:
             if transection.provider_reference:
                 source_reference = transection.source_transaction_id.provider_reference
+
+                # Order API deprecated remove code to manage 'ord_' references
                 if source_reference.startswith('ord_'):
                     payment_data = self.provider_id._api_mollie_get_payment_data(source_reference, force_payment=True)
                     source_reference = payment_data.get('id')
+
                 refund_data = transection.provider_id._api_mollie_refund_data(source_reference, transection.provider_reference)
                 if refund_data and refund_data.get('id'):
                     if refund_data.get('status') == 'refunded':
                         transection._set_done()
+                    elif refund_data.get('status') in ['pending', 'queued', 'processing']:
+                        transection._set_pending()
                     elif refund_data.get('status') == 'failed':
                         self._set_canceled("Mollie: " + _("Mollie: failed due to status: %s", refund_data.get('status')))
 
-    def _process_capture_transactions_status(self, payment_reference):
+    def _process_capture_transactions_status(self, payment_reference, payment_status):
         capture_data = self.provider_id._api_mollie_get_capture_data(payment_reference)
-        if capture_data.get('count'):
-            for capture in capture_data['_embedded']['captures']:
-                capture_tx = self.child_transaction_ids.filtered(lambda ctx: ctx.provider_reference == capture['id'])
-                if not capture_tx:
-                    capture_tx = self._create_child_transaction(
-                        capture['amount']['value'],
-                        provider_reference=capture.get('id'),
-                        mollie_origin_payment_reference=capture.get('paymentId'),
-                        mollie_payment_shipment_reference=capture.get('shipmentId'))
-                if capture_tx:
-                    if capture['status'] == 'succeeded':
-                        capture_tx._set_done()
-                    elif capture['status'] == 'failed':
-                        capture_tx._set_canceled()
-                    elif capture['status'] == 'pending':
-                        capture_tx._set_pending()
+        if not capture_data.get('count'):
+            return
 
-    def _cron_mollie_capture_transaction(self):
-        domain = [
-            ('provider_id.mollie_auto_capture', '!=', False),
-            ('provider_id.code', '=', 'mollie'),
-            ('provider_reference', '!=', False),
-            ('state', '=', 'authorized')
-        ]
-        transactions = self.search(domain, limit=10)
-        if transactions:
-            capture_wizard_data = transactions.action_capture()
-            if capture_wizard_data.get('context'):
-                capture_wizard = self.env[capture_wizard_data['res_model']].with_context(capture_wizard_data['context']).create({})
-                if capture_wizard.mollie_amount_to_capture:
-                    capture_wizard.action_mollie_capture()
-                else:
-                    capture_wizard.unlink()
+        for capture in capture_data['_embedded']['captures']:
+            capture_id = capture.get('id')
+            capture_status = capture.get('status')
+            capture_amount = capture['amount']['value']
+            payment_id = capture.get('paymentId')
+            shipment_id = capture.get('shipmentId')
+
+            # Find existing transaction for this capture
+            capture_tx = self.child_transaction_ids.filtered(lambda tx: tx.provider_reference == capture_id)
+
+            # Create a new child transaction if not found
+            if not capture_tx:
+                capture_tx = self._create_child_transaction(
+                    capture_amount,
+                    provider_reference=capture_id,
+                    mollie_origin_payment_reference=payment_id,
+                    mollie_payment_shipment_reference=shipment_id
+                )
+
+            # Update transaction status if needed
+            if capture_tx:
+                current_state = capture_tx.state
+                if capture_status == 'succeeded' and current_state != 'done':
+                    capture_tx._set_done()
+                elif capture_status == 'failed' and current_state != 'cancel':
+                    capture_tx._set_canceled()
+                elif capture_status == 'pending' and current_state != 'pending':
+                    capture_tx._set_pending()
+
+        if payment_status == 'paid' and self.payment_method_code not in const.MULTI_CAPTURE_METHODS:
+            # Calculate amounts for different transaction states
+            transaction_total_amount = self.amount
+            confirmed_amount = sum(
+                self.child_transaction_ids.filtered(lambda tx: tx.state == 'done').mapped('amount')
+            )
+            cancelled_amount = sum(
+                self.child_transaction_ids.filtered(lambda tx: tx.state == 'cancel').mapped('amount')
+            )
+
+            # Calculate remaining amount that needs to be cancelled
+            remaining_amount_to_cancel = transaction_total_amount - confirmed_amount - cancelled_amount
+
+            # Cancel the remaining amount if any
+            if self.currency_id.compare_amounts(remaining_amount_to_cancel, 0) > 0:
+                void_transaction = self._create_child_transaction(remaining_amount_to_cancel)
+                void_transaction._log_sent_message()
+                void_transaction._set_canceled()

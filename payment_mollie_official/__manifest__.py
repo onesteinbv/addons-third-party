@@ -2,7 +2,7 @@
 
 {
     'name': 'Mollie Payments Extended',
-    'version': '18.0.0.1',
+    'version': '18.0.0.5',
     'category': 'eCommerce',
     'license': 'LGPL-3',
     'author': 'Mollie',
@@ -21,7 +21,6 @@
         'python': ['phonenumbers'],
     },
     'data': [
-        'data/cron.xml',
         'security/ir.model.access.csv',
         'views/payment_views.xml',
         'views/payment_transaction.xml',
@@ -29,7 +28,7 @@
         'views/payment_mollie_templates.xml',
         'views/account_move_view.xml',
         'views/account_payment_register.xml',
-        'wizard/payment_capture_wizard_views.xml',
+        'wizard/mollie_sync_wizard.xml'
     ],
 
     'assets': {
